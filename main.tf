@@ -43,7 +43,8 @@ resource "aws_dynamodb_table" "orders" {
   deletion_protection_enabled = true
 }
 
-# Sign-in attempt counters for /orders: one row per IP per 15 minutes, auto-deleted.
+# Per-IP rate-limit counters (sign-ins on /orders and placed orders), auto-deleted.
+# Still named login-attempts so the table isn't replaced.
 resource "aws_dynamodb_table" "login_attempts" {
   name         = "${var.name}-login-attempts"
   billing_mode = "PAY_PER_REQUEST"
