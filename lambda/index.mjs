@@ -233,7 +233,7 @@ const layout = (title, inner, { wide = false } = {}) => `<!doctype html>
 <style>${CSS}</style></head><body><div class="stack${wide ? " wide" : ""}"><main class="card">
 <header class="head">
 ${COOKIES_SVG}
-<p class="kicker">from our kitchen to yours</p>
+<p class="kicker">from my kitchen to yours</p>
 <h1><a href="/">${shopTitle()}</a></h1>
 </header>
 ${inner}
@@ -286,7 +286,7 @@ async function orderPage(message = "", values = {}) {
   const windows = openWindows(await getCounts());
   const homeReq = values.location === "home" ? " required" : "";
   const form = windows.length
-    ? `<p class="tagline">Fill out the card &amp; we&rsquo;ll get the oven warm.</p>
+    ? `<p class="tagline">Fill out the card &amp; I&rsquo;ll get the oven warm.</p>
 <form method="post" action="/">
   <div class="row">
     <div class="field"><label for="firstName">First name</label>
@@ -482,7 +482,7 @@ async function placeOrder(event) {
   const where = location === "home" ? address : LOCATIONS[location];
   return html(200, layout(SHOP, `<h2>Thanks, ${esc(firstName)}!</h2>
 <p class="msg">Your order for <strong>${boxes} box${boxes === 1 ? "" : "es"}</strong> is in for delivery on <strong>${esc(prettyDate(pickupDate))}</strong> to <strong>${esc(where)}</strong>.
-We'll ${contactPref} you at ${esc(phone)} if we have questions.</p>
+I'll ${contactPref} you at ${esc(phone)} if I have questions.</p>
 <p><a href="/">Place another order</a></p>`));
 }
 
@@ -622,7 +622,8 @@ async function adminPage(event) {
   <td>${esc(o.location === "home" ? `Home: ${o.address}` : LOCATIONS[o.location] || "")}</td>
   <td>${esc(new Date(o.createdAt).toLocaleString("en-US", { timeZone: TZ }))}</td></tr>`).join("");
 
-  return html(200, layout(`${SHOP} – Orders`, `<h2>Orders (${orders.length}, ${orders.reduce((t, o) => t + (Number(o.boxes) || 0), 0)} boxes)</h2>
+  const totalBoxes = orders.reduce((t, o) => t + (Number(o.boxes) || 0), 0);
+  return html(200, layout(`${SHOP} – Orders`, `<h2>Orders (${orders.length}, ${totalBoxes} box${totalBoxes === 1 ? "" : "es"})</h2>
 <h3>Delivery weeks</h3>
 <div class="scroll"><table><tr><th>Week</th><th>Order by</th><th>Boxes / limit</th></tr>${summary}</table></div>
 <h3>All orders <span class="sub">(<span id="doneCount">${orders.filter((o) => o.delivered).length}</span> of ${orders.length} delivered)</span></h3>
