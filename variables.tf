@@ -12,23 +12,37 @@ variable "name" {
 variable "shop_name" {
   description = "Title shown on the order page"
   type        = string
-  default     = "Cookie Orders"
+  default     = "Operation: Bake It Off"
 }
 
 variable "timezone" {
-  description = "Used to hide past pickup dates and show order times"
+  description = "Used for order cutoffs and to show order times"
   type        = string
   default     = "America/Chicago"
 }
 
-variable "pickup_slots" {
-  description = "Pickup dates (YYYY-MM-DD) mapped to the max number of orders for that date. Set a date to 0 to close it."
-  type        = map(number)
+variable "delivery_windows" {
+  description = "Delivery weeks, keyed by the week's first date. limit = boxes for the whole week, shared by all its dates. Set limit to 0 to close a week."
+  type = map(object({
+    dates = list(string)
+    limit = number
+  }))
 
   validation {
-    condition     = alltrue([for d in keys(var.pickup_slots) : can(regex("^\\d{4}-\\d{2}-\\d{2}$", d))])
-    error_message = "Pickup dates must look like 2026-12-19."
+    condition = alltrue(flatten([
+      for id, w in var.delivery_windows : concat(
+        [can(regex("^\\d{4}-\\d{2}-\\d{2}$", id)), length(w.dates) > 0, contains(w.dates, id)],
+        [for d in w.dates : can(regex("^\\d{4}-\\d{2}-\\d{2}$", d))]
+      )
+    ]))
+    error_message = "Each week's key must be its first delivery date, and all dates must look like 2026-12-06."
   }
+}
+
+variable "order_cutoff_days" {
+  description = "Orders for a week close at the end of the day (in var.timezone) this many days before the week's first delivery date."
+  type        = number
+  default     = 3
 }
 
 variable "admin_key" {

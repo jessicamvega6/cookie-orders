@@ -1,12 +1,15 @@
 # Copy to terraform.tfvars and fill in. terraform.tfvars is git-ignored.
 
-shop_name = "Sarah's Cookies"
+shop_name = "Operation: Bake It Off"
 
-# Pickup date = max orders for that date
-pickup_slots = {
-  "2026-12-12" = 10
-  "2026-12-19" = 15
-  "2026-12-23" = 15
+# Delivery weeks: up to `limit` boxes per week, shared across its dates.
+# Each week closes at 11:59pm Central, 3 days before its first date
+# (e.g. the Dec 6-8 week closes at the end of Dec 3).
+delivery_windows = {
+  "2026-12-06" = { dates = ["2026-12-06", "2026-12-07", "2026-12-08"], limit = 12 }
+  "2026-12-13" = { dates = ["2026-12-13", "2026-12-14", "2026-12-15"], limit = 12 }
+  "2026-12-20" = { dates = ["2026-12-20", "2026-12-21", "2026-12-22"], limit = 12 }
+  "2026-12-27" = { dates = ["2026-12-27", "2026-12-28", "2026-12-29"], limit = 12 }
 }
 
 # Generate one with: openssl rand -hex 16

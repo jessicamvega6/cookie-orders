@@ -36,7 +36,8 @@ resource "aws_dynamodb_table" "orders" {
   deletion_protection_enabled = true
 }
 
-# One row per pickup date: { pickupDate, orderCount }. Created by the Lambda on first order.
+# One row per delivery week: { pickupDate = window id (its first date), orderCount }.
+# Created by the Lambda on the first order for that week.
 resource "aws_dynamodb_table" "pickup_counts" {
   name         = "${var.name}-pickup-counts"
   billing_mode = "PAY_PER_REQUEST"
@@ -114,12 +115,13 @@ resource "aws_lambda_function" "app" {
 
   environment {
     variables = {
-      ORDERS_TABLE = aws_dynamodb_table.orders.name
-      COUNTS_TABLE = aws_dynamodb_table.pickup_counts.name
-      PICKUP_SLOTS = jsonencode(var.pickup_slots)
-      ADMIN_KEY    = var.admin_key
-      TIMEZONE     = var.timezone
-      SHOP_NAME    = var.shop_name
+      ORDERS_TABLE      = aws_dynamodb_table.orders.name
+      COUNTS_TABLE      = aws_dynamodb_table.pickup_counts.name
+      DELIVERY_WINDOWS  = jsonencode(var.delivery_windows)
+      ORDER_CUTOFF_DAYS = tostring(var.order_cutoff_days)
+      ADMIN_KEY         = var.admin_key
+      TIMEZONE          = var.timezone
+      SHOP_NAME         = var.shop_name
     }
   }
 
