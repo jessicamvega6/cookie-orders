@@ -57,14 +57,21 @@ variable "order_retention_days" {
 }
 
 variable "admin_key" {
-  description = "Password for the /orders page. Use a long random string. Changing it signs everyone out."
+  description = "Password for the /orders page. Use a long random string. It's stored only in SSM Parameter Store, never in Terraform state or plan files. After changing it, also bump admin_key_version, or the change won't be sent. Changing it signs everyone out."
   type        = string
   sensitive   = true
+  ephemeral   = true # never saved to state or to saved plan files
 
   validation {
     condition     = length(var.admin_key) >= 16
     error_message = "Use at least 16 characters."
   }
+}
+
+variable "admin_key_version" {
+  description = "Bump this (1 -> 2 -> ...) whenever you change admin_key. Terraform can't see the password itself, so this number is how it knows to send the new one."
+  type        = number
+  default     = 1
 }
 
 variable "reserved_concurrency" {

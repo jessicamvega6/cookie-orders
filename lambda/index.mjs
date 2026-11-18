@@ -2,7 +2,7 @@
 //   GET  /        -> order form (only shows delivery dates whose week is still open)
 //   POST /        -> place an order
 //   GET  /orders  -> order list for your friend (password page until signed in)
-//   POST /orders  -> sign in with ADMIN_KEY (sets a cookie), sign out, or mark delivered
+//   POST /orders  -> sign in with the admin password (sets a cookie), sign out, or mark delivered
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
   DynamoDBDocumentClient,
@@ -10,9 +10,11 @@ import {
   UpdateCommand,
   ScanCommand,
 } from "@aws-sdk/lib-dynamodb";
+import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import { randomUUID, createHash, createHmac, timingSafeEqual } from "node:crypto";
 
 const db = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+const ssm = new SSMClient({});
 
 const ORDERS_TABLE = process.env.ORDERS_TABLE;
 const COUNTS_TABLE = process.env.COUNTS_TABLE;
@@ -24,7 +26,7 @@ const RETENTION_DAYS = Number(process.env.ORDER_RETENTION_DAYS ?? 30);
 // whole week; every date in the week draws from it.
 const WINDOWS = JSON.parse(process.env.DELIVERY_WINDOWS || "{}");
 const CUTOFF_DAYS = Number(process.env.ORDER_CUTOFF_DAYS ?? 3);
-const ADMIN_KEY = process.env.ADMIN_KEY || "";
+const ADMIN_KEY_PARAM = process.env.ADMIN_KEY_PARAM; // SSM parameter name holding the /orders password
 const TZ = process.env.TIMEZONE || "America/Chicago";
 const SHOP = process.env.SHOP_NAME || "Operation: Bake It Off";
 
@@ -64,11 +66,14 @@ const LOCATIONS = {
 };
 const CONTACT_PREFS = { call: "Call", text: "Text" };
 
-// Keep digits; accept 10 digits or 11 starting with 1. Returns (205) 555-1234 or "".
+// Keep digits; accept 10 digits or 11 starting with 1. Returns (205) 555-1234 or ""
+// if it can't be a real US number: area code and exchange can't start with 0 or 1,
+// and the area code can't be a service code like 911.
 function formatPhone(raw) {
   let d = String(raw || "").replace(/\D/g, "");
   if (d.length === 11 && d.startsWith("1")) d = d.slice(1);
-  return d.length === 10 ? `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}` : "";
+  if (!/^[2-9]\d\d[2-9]\d{6}$/.test(d) || /^[2-9]11/.test(d)) return "";
+  return `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}`;
 }
 
 const fullName = (o) => o.firstName ? `${o.firstName} ${o.lastName}` : o.name || "";
@@ -103,7 +108,7 @@ const CSS = `
   .row{display:grid;grid-template-columns:1fr 1fr;gap:0 .8rem} @media (max-width:420px){.row{grid-template-columns:1fr}}
   fieldset{border:0;padding:0;margin:.9rem 0 0} legend{font-weight:700;margin:0 0 .4rem;padding:0}
   .choices{display:flex;gap:1.5rem} .choices label{display:flex;align-items:center;gap:.4rem;margin:0;font-weight:400}
-  .choices input{width:auto;margin:0} .hint{margin:.3rem 0 0;font-size:.9rem;color:var(--brown);font-style:italic} [hidden]{display:none!important}
+  .choices input{width:auto;margin:0} .err{margin:.3rem 0 0;color:var(--crimson);font-weight:700;font-size:.9rem} .hint{margin:.3rem 0 0;font-size:.9rem;color:var(--brown);font-style:italic} [hidden]{display:none!important}
   .scroll{overflow-x:auto} .deliv{margin:0;text-align:center} .deliv input[type=checkbox]{width:1.4rem;height:1.4rem;margin:0;accent-color:var(--crimson);cursor:pointer}
   tr.done td{color:#8a8178;background:#f6f3ee} .sub{font-size:.9rem;font-weight:400;color:var(--brown)} button.secondary{background:#fff;color:var(--crimson);border:1px solid var(--crimson);width:auto;padding:.4rem 1rem;font-size:.9rem}
   table{border-collapse:collapse;width:100%;font-size:.9rem} th,td{border-bottom:1px solid #e6d8c6;padding:.4rem;text-align:left;vertical-align:top}
@@ -172,7 +177,8 @@ async function orderPage(message = "", values = {}) {
     <input id="lastName" name="lastName" maxlength="50" autocomplete="family-name" required value="${esc(values.lastName)}"></div>
   </div>
   <label for="phone">Phone</label>
-  <input id="phone" name="phone" type="tel" maxlength="20" autocomplete="tel" placeholder="(205) 555-1234" required value="${esc(values.phone)}">
+  <input id="phone" name="phone" type="tel" inputmode="tel" maxlength="20" autocomplete="tel" placeholder="(205) 555-1234" required aria-describedby="phoneErr" value="${esc(values.phone)}">
+  <p class="err" id="phoneErr" aria-live="polite" hidden></p>
   <fieldset>
     <legend>Best way to reach you</legend>
     <div class="choices">
@@ -233,6 +239,32 @@ const ORDER_JS = `
   const sync = () => { const home = loc.value === "home"; box.hidden = !home; addr.required = home; };
   loc.addEventListener("change", () => { sync(); if (loc.value === "home") addr.focus(); });
   sync();
+
+  // Phone: check it when they leave the field or submit, tidy the format,
+  // and say what's wrong. The server checks the same rules.
+  const phone = document.getElementById("phone"), phoneErr = document.getElementById("phoneErr");
+  const phoneDigits = () => {
+    let d = phone.value.replace(/\\D/g, "");
+    if (d.length === 11 && d[0] === "1") d = d.slice(1);
+    return d;
+  };
+  const phoneProblem = (d) =>
+    !d ? "Please enter your phone number."
+    : d.length !== 10 ? "Please enter a 10-digit phone number, including area code."
+    : !/^[2-9]\\d\\d[2-9]/.test(d) || /^[2-9]11/.test(d) ? "That doesn't look like a valid US phone number."
+    : "";
+  const checkPhone = () => {
+    const d = phoneDigits(), problem = phoneProblem(d);
+    if (!problem) phone.value = "(" + d.slice(0, 3) + ") " + d.slice(3, 6) + "-" + d.slice(6);
+    phone.setCustomValidity(problem);
+    phoneErr.textContent = problem;
+    phoneErr.hidden = !problem;
+    phone.setAttribute("aria-invalid", problem ? "true" : "false");
+    return !problem;
+  };
+  phone.addEventListener("blur", () => { if (phone.value) checkPhone(); });
+  phone.addEventListener("input", () => { if (!phoneErr.hidden) checkPhone(); });
+  phone.form.addEventListener("submit", (e) => { if (!checkPhone()) { e.preventDefault(); phone.focus(); } });
 `;
 
 async function placeOrder(event) {
@@ -251,7 +283,7 @@ async function placeOrder(event) {
   if (!firstName || !lastName) {
     return orderPage("Please fill in your first and last name.", o);
   }
-  if (!phone) return orderPage("Please enter a 10-digit phone number.", o);
+  if (!phone) return orderPage("Please enter a valid 10-digit US phone number, including area code.", o);
   if (!contactPref) return orderPage("Please choose call or text.", o);
   if (!location) return orderPage("Please pick a delivery location.", o);
   if (location === "home" && !address) return orderPage("Please enter your home address.", o);
@@ -306,22 +338,39 @@ We'll ${contactPref} you at ${esc(phone)} if we have questions.</p>
 }
 
 // ---------- orders-page sign-in ----------
-// The cookie holds a value derived from ADMIN_KEY, never the key itself.
+// The password lives in SSM Parameter Store (SecureString). It's fetched only when
+// /orders is used, then cached for a few minutes so a changed password takes effect
+// without a redeploy.
+const KEY_CACHE_MS = 5 * 60_000;
+let keyCache; // { value, at }
+let keyFetch; // in-flight request, shared by concurrent callers
+
+async function getAdminKey() {
+  if (keyCache && Date.now() - keyCache.at < KEY_CACHE_MS) return keyCache.value;
+  keyFetch ??= ssm
+    .send(new GetParameterCommand({ Name: ADMIN_KEY_PARAM, WithDecryption: true }))
+    .then((r) => (keyCache = { value: r.Parameter?.Value || "", at: Date.now() }).value)
+    .finally(() => { keyFetch = undefined; });
+  return keyFetch;
+}
+
+// The cookie holds a value derived from the password, never the password itself.
 // Changing admin_key signs everyone out.
 const COOKIE = "bio_admin";
 const SESSION_DAYS = 30;
-const sessionToken = () => createHmac("sha256", ADMIN_KEY).update("orders-session-v1").digest("hex");
+const sessionToken = (key) => createHmac("sha256", key).update("orders-session-v1").digest("hex");
 
 const sameSecret = (a, b) => {
   const x = Buffer.from(String(a)), y = Buffer.from(String(b));
   return x.length === y.length && timingSafeEqual(x, y);
 };
 
-const isSignedIn = (event) => {
-  if (!ADMIN_KEY) return false;
+const isSignedIn = async (event) => {
   const cookies = event.cookies || (event.headers?.cookie || "").split(/;\s*/);
   const value = cookies.map((c) => c.split("=")).find(([k]) => k === COOKIE)?.[1];
-  return !!value && sameSecret(value, sessionToken());
+  if (!value) return false; // skip the SSM call for visitors without a cookie
+  const key = await getAdminKey();
+  return !!key && sameSecret(value, sessionToken(key));
 };
 
 // Sign-in attempts allowed per IP address per window, counted in DynamoDB so the
@@ -368,17 +417,18 @@ async function ordersPost(event) {
   if (await tooManyAttempts(event)) {
     return signInPage(`Too many sign-in attempts. Please wait ${ATTEMPT_WINDOW_MIN} minutes and try again.`, 429);
   }
-  if (!ADMIN_KEY || !sameSecret(f.key || "", ADMIN_KEY)) {
+  const key = await getAdminKey();
+  if (!key || !sameSecret(f.key || "", key)) {
     await new Promise((r) => setTimeout(r, 1000)); // slow down guessing
     return signInPage("That password didn't match.", 401);
   }
-  return redirect("/orders", [`${COOKIE}=${sessionToken()}; ${cookieAttrs}; Max-Age=${SESSION_DAYS * 86400}`]);
+  return redirect("/orders", [`${COOKIE}=${sessionToken(key)}; ${cookieAttrs}; Max-Age=${SESSION_DAYS * 86400}`]);
 }
 
 // Mark one order delivered / not delivered. Called by the checkbox via fetch
 // (answers 204) or by a plain form post without JavaScript (redirects back).
 async function setDelivered(event, f) {
-  if (!isSignedIn(event)) return html(401, layout("Signed out", "<p>Please sign in again.</p>"));
+  if (!(await isSignedIn(event))) return html(401, layout("Signed out", "<p>Please sign in again.</p>"));
   const orderId = String(f.orderId || "");
   const delivered = f.delivered === "on";
   try {
@@ -399,7 +449,7 @@ async function setDelivered(event, f) {
 }
 
 async function adminPage(event) {
-  if (!isSignedIn(event)) return signInPage();
+  if (!(await isSignedIn(event))) return signInPage();
 
   const [orders, counts] = await Promise.all([scanAll(ORDERS_TABLE), getCounts()]);
   orders.sort((a, b) =>
@@ -445,7 +495,8 @@ const ADMIN_JS = `
       const body = new URLSearchParams(new FormData(form)); // read before disabling: disabled boxes aren't sent
       box.disabled = true;
       try {
-        const r = await fetch(form.action, {
+        // getAttribute: form.action would return the hidden input named "action"
+        const r = await fetch(form.getAttribute("action"), {
           method: "POST",
           headers: { "content-type": "application/x-www-form-urlencoded", "x-requested-with": "fetch" },
           body,

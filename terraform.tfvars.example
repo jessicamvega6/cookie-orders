@@ -13,6 +13,9 @@ delivery_windows = {
 }
 
 # Generate one with: openssl rand -hex 16
-admin_key = "replace-with-a-long-random-string"
+# Stored only in SSM Parameter Store; Terraform never writes it to state.
+# To change it: set a new admin_key AND bump admin_key_version (1 -> 2), then apply.
+admin_key         = "replace-with-a-long-random-string"
+admin_key_version = 1
 
 budget_email = "you@example.com"

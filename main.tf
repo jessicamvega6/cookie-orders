@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.5"
+  required_version = ">= 1.11" # write-only arguments (value_wo)
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -115,12 +115,29 @@ resource "aws_iam_role_policy" "lambda" {
         Resource = aws_dynamodb_table.login_attempts.arn
       },
       {
+        # Decryption needs no kms:Decrypt here: the AWS-managed aws/ssm key's own
+        # policy allows it for calls made through SSM in this account.
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = aws_ssm_parameter.admin_key.arn
+      },
+      {
         Effect   = "Allow"
         Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "${aws_cloudwatch_log_group.lambda.arn}:*"
       }
     ]
   })
+}
+
+# The /orders password, encrypted with the free AWS-managed aws/ssm key.
+# value_wo is write-only: Terraform sends it to AWS but never stores it in state.
+resource "aws_ssm_parameter" "admin_key" {
+  name             = "/${var.name}/admin-key"
+  description      = "Password for the cookie orders /orders page"
+  type             = "SecureString"
+  value_wo         = var.admin_key
+  value_wo_version = var.admin_key_version
 }
 
 # Created up front so logs expire after a week instead of being kept (and billed) forever.
@@ -150,7 +167,7 @@ resource "aws_lambda_function" "app" {
       ORDER_RETENTION_DAYS = tostring(var.order_retention_days)
       DELIVERY_WINDOWS     = jsonencode(var.delivery_windows)
       ORDER_CUTOFF_DAYS    = tostring(var.order_cutoff_days)
-      ADMIN_KEY            = var.admin_key
+      ADMIN_KEY_PARAM      = aws_ssm_parameter.admin_key.name
       TIMEZONE             = var.timezone
       SHOP_NAME            = var.shop_name
     }
