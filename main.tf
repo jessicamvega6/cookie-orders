@@ -31,9 +31,33 @@ resource "aws_dynamodb_table" "orders" {
     type = "S"
   }
 
+  # Each order carries expiresAt (delivery date + order_retention_days); DynamoDB
+  # deletes it for free, usually within a few days after that time.
+  ttl {
+    attribute_name = "expiresAt"
+    enabled        = true
+  }
+
   # Free safety net so a stray `terraform destroy` can't wipe the orders.
   # Set to false first if you really want to delete the table.
   deletion_protection_enabled = true
+}
+
+# Sign-in attempt counters for /orders: one row per IP per 15 minutes, auto-deleted.
+resource "aws_dynamodb_table" "login_attempts" {
+  name         = "${var.name}-login-attempts"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "id"
+
+  attribute {
+    name = "id"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expiresAt"
+    enabled        = true
+  }
 }
 
 # One row per delivery week: { pickupDate = window id (its first date), orderCount }.
@@ -77,13 +101,18 @@ resource "aws_iam_role_policy" "lambda" {
     Statement = [
       {
         Effect   = "Allow"
-        Action   = ["dynamodb:PutItem", "dynamodb:Scan"]
+        Action   = ["dynamodb:PutItem", "dynamodb:Scan", "dynamodb:UpdateItem"] # UpdateItem: delivered checkbox
         Resource = aws_dynamodb_table.orders.arn
       },
       {
         Effect   = "Allow"
         Action   = ["dynamodb:UpdateItem", "dynamodb:Scan"]
         Resource = aws_dynamodb_table.pickup_counts.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:UpdateItem"]
+        Resource = aws_dynamodb_table.login_attempts.arn
       },
       {
         Effect   = "Allow"
@@ -115,13 +144,15 @@ resource "aws_lambda_function" "app" {
 
   environment {
     variables = {
-      ORDERS_TABLE      = aws_dynamodb_table.orders.name
-      COUNTS_TABLE      = aws_dynamodb_table.pickup_counts.name
-      DELIVERY_WINDOWS  = jsonencode(var.delivery_windows)
-      ORDER_CUTOFF_DAYS = tostring(var.order_cutoff_days)
-      ADMIN_KEY         = var.admin_key
-      TIMEZONE          = var.timezone
-      SHOP_NAME         = var.shop_name
+      ORDERS_TABLE         = aws_dynamodb_table.orders.name
+      COUNTS_TABLE         = aws_dynamodb_table.pickup_counts.name
+      ATTEMPTS_TABLE       = aws_dynamodb_table.login_attempts.name
+      ORDER_RETENTION_DAYS = tostring(var.order_retention_days)
+      DELIVERY_WINDOWS     = jsonencode(var.delivery_windows)
+      ORDER_CUTOFF_DAYS    = tostring(var.order_cutoff_days)
+      ADMIN_KEY            = var.admin_key
+      TIMEZONE             = var.timezone
+      SHOP_NAME            = var.shop_name
     }
   }
 

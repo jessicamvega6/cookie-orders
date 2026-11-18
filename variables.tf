@@ -45,6 +45,17 @@ variable "order_cutoff_days" {
   default     = 3
 }
 
+variable "order_retention_days" {
+  description = "Orders (with customers' names, phones and addresses) are deleted automatically this many days after their delivery date."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.order_retention_days >= 1 && floor(var.order_retention_days) == var.order_retention_days
+    error_message = "Use a whole number of days, 1 or more."
+  }
+}
+
 variable "admin_key" {
   description = "Password for the /orders page. Use a long random string. Changing it signs everyone out."
   type        = string

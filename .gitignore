@@ -3,3 +3,8 @@
 *.tfstate.*
 terraform.tfvars
 build/
+
+# Saved terraform plans contain variable values (including admin_key)
+*.tfplan
+tfplan
+cookies

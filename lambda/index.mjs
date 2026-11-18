@@ -2,7 +2,7 @@
 //   GET  /        -> order form (only shows delivery dates whose week is still open)
 //   POST /        -> place an order
 //   GET  /orders  -> order list for your friend (password page until signed in)
-//   POST /orders  -> sign in with ADMIN_KEY (sets a cookie) or sign out
+//   POST /orders  -> sign in with ADMIN_KEY (sets a cookie), sign out, or mark delivered
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
   DynamoDBDocumentClient,
@@ -10,12 +10,15 @@ import {
   UpdateCommand,
   ScanCommand,
 } from "@aws-sdk/lib-dynamodb";
-import { randomUUID, createHmac, timingSafeEqual } from "node:crypto";
+import { randomUUID, createHash, createHmac, timingSafeEqual } from "node:crypto";
 
 const db = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 
 const ORDERS_TABLE = process.env.ORDERS_TABLE;
 const COUNTS_TABLE = process.env.COUNTS_TABLE;
+const ATTEMPTS_TABLE = process.env.ATTEMPTS_TABLE;
+// Orders (names, phones, addresses) are deleted automatically this many days after delivery.
+const RETENTION_DAYS = Number(process.env.ORDER_RETENTION_DAYS ?? 30);
 // { "2026-12-06": { "dates": ["2026-12-06","2026-12-07","2026-12-08"], "limit": 12 }, ... }
 // Keyed by the window's first delivery date. "limit" is the number of boxes for the
 // whole week; every date in the week draws from it.
@@ -70,17 +73,17 @@ function formatPhone(raw) {
 
 const fullName = (o) => o.firstName ? `${o.firstName} ${o.lastName}` : o.name || "";
 
+// Sent with every response. CSP and SECURITY_HEADERS are defined near the bottom of
+// the file, once the page scripts they hash exist.
 const html = (statusCode, body) => ({
   statusCode,
-  headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+  headers: { ...SECURITY_HEADERS, "content-type": "text/html; charset=utf-8" },
   body,
 });
 
-const layout = (title, inner) => `<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${esc(title)}</title>
-<style>
+const sha256 = (s) => `'sha256-${createHash("sha256").update(s, "utf8").digest("base64")}'`;
+
+const CSS = `
   /* Colors from the Operation: Bake It Off flyer */
   :root{--crimson:#a3293a;--crimson-dark:#82202e;--black:#0d0d0d;--gold:#e3b94a;--cream:#fbf4c4;--brown:#6b4a33;--ink:#1d1a17;--line:#c9b9a5}
   body{margin:0;padding:1.5rem 1rem;background:var(--crimson);color:var(--ink);font-family:"Bookman Old Style","Bookman",Georgia,serif;line-height:1.4}
@@ -101,10 +104,17 @@ const layout = (title, inner) => `<!doctype html>
   fieldset{border:0;padding:0;margin:.9rem 0 0} legend{font-weight:700;margin:0 0 .4rem;padding:0}
   .choices{display:flex;gap:1.5rem} .choices label{display:flex;align-items:center;gap:.4rem;margin:0;font-weight:400}
   .choices input{width:auto;margin:0} .hint{margin:.3rem 0 0;font-size:.9rem;color:var(--brown);font-style:italic} [hidden]{display:none!important}
-  .scroll{overflow-x:auto} button.secondary{background:#fff;color:var(--crimson);border:1px solid var(--crimson);width:auto;padding:.4rem 1rem;font-size:.9rem}
+  .scroll{overflow-x:auto} .deliv{margin:0;text-align:center} .deliv input[type=checkbox]{width:1.4rem;height:1.4rem;margin:0;accent-color:var(--crimson);cursor:pointer}
+  tr.done td{color:#8a8178;background:#f6f3ee} .sub{font-size:.9rem;font-weight:400;color:var(--brown)} button.secondary{background:#fff;color:var(--crimson);border:1px solid var(--crimson);width:auto;padding:.4rem 1rem;font-size:.9rem}
   table{border-collapse:collapse;width:100%;font-size:.9rem} th,td{border-bottom:1px solid #e6d8c6;padding:.4rem;text-align:left;vertical-align:top}
   th{background:var(--cream)}
-</style></head><body><main class="card">
+`;
+
+const layout = (title, inner) => `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${esc(title)}</title>
+<style>${CSS}</style></head><body><main class="card">
 <h1 class="banner"><a href="/">${esc(SHOP)}</a></h1>
 ${inner}
 </main></body></html>`;
@@ -196,7 +206,15 @@ async function orderPage(message = "", values = {}) {
   <input class="hp" name="website" tabindex="-1" autocomplete="off" aria-hidden="true">
   <button type="submit">Place order</button>
 </form>
-<script>
+<script>${ORDER_JS}</script>`
+    : `<p class="msg">Orders are closed for all delivery dates right now.</p>`;
+
+  return html(200, layout(SHOP, `${message ? `<p class="msg">${esc(message)}</p>` : ""}
+${form}`));
+}
+
+// Static so its hash can go in the CSP. Don't put ${...} values in here.
+const ORDER_JS = `
   // Limit the box count to what's left in the chosen date's week.
   const date = document.getElementById("pickupDate"), boxes = document.getElementById("boxes");
   const syncBoxes = () => {
@@ -215,12 +233,7 @@ async function orderPage(message = "", values = {}) {
   const sync = () => { const home = loc.value === "home"; box.hidden = !home; addr.required = home; };
   loc.addEventListener("change", () => { sync(); if (loc.value === "home") addr.focus(); });
   sync();
-</script>`
-    : `<p class="msg">Orders are closed for all delivery dates right now.</p>`;
-
-  return html(200, layout(SHOP, `${message ? `<p class="msg">${esc(message)}</p>` : ""}
-${form}`));
-}
+`;
 
 async function placeOrder(event) {
   const o = parseForm(event);
@@ -280,6 +293,8 @@ async function placeOrder(event) {
       orderId: randomUUID(),
       createdAt: new Date().toISOString(),
       pickupDate, boxes, firstName, lastName, phone, contactPref, location, address,
+      // DynamoDB TTL (epoch seconds): deleted RETENTION_DAYS after the delivery date.
+      expiresAt: Math.floor(Date.parse(`${minusDays(pickupDate, -RETENTION_DAYS)}T23:59:59Z`) / 1000),
     },
   }));
 
@@ -309,9 +324,28 @@ const isSignedIn = (event) => {
   return !!value && sameSecret(value, sessionToken());
 };
 
+// Sign-in attempts allowed per IP address per window, counted in DynamoDB so the
+// limit holds across Lambda instances and parallel requests.
+const MAX_ATTEMPTS = 10;
+const ATTEMPT_WINDOW_MIN = 15;
+
+async function tooManyAttempts(event) {
+  // Function URLs report the real connecting IP here (not a client-set header).
+  const ip = event.requestContext?.http?.sourceIp || "unknown";
+  const bucket = Math.floor(Date.now() / (ATTEMPT_WINDOW_MIN * 60_000));
+  const r = await db.send(new UpdateCommand({
+    TableName: ATTEMPTS_TABLE,
+    Key: { id: `${ip}#${bucket}` },
+    UpdateExpression: "ADD attempts :one SET expiresAt = :exp",
+    ExpressionAttributeValues: { ":one": 1, ":exp": (bucket + 2) * ATTEMPT_WINDOW_MIN * 60 },
+    ReturnValues: "UPDATED_NEW",
+  }));
+  return r.Attributes.attempts > MAX_ATTEMPTS;
+}
+
 const redirect = (location, cookies) => ({
   statusCode: 303,
-  headers: { location, "cache-control": "no-store" },
+  headers: { ...SECURITY_HEADERS, location },
   ...(cookies ? { cookies } : {}),
 });
 
@@ -330,11 +364,38 @@ ${message ? `<p class="msg">${esc(message)}</p>` : ""}
 async function ordersPost(event) {
   const f = parseForm(event);
   if (f.action === "signout") return redirect("/orders", [`${COOKIE}=; ${cookieAttrs}; Max-Age=0`]);
+  if (f.action === "delivered") return setDelivered(event, f);
+  if (await tooManyAttempts(event)) {
+    return signInPage(`Too many sign-in attempts. Please wait ${ATTEMPT_WINDOW_MIN} minutes and try again.`, 429);
+  }
   if (!ADMIN_KEY || !sameSecret(f.key || "", ADMIN_KEY)) {
     await new Promise((r) => setTimeout(r, 1000)); // slow down guessing
     return signInPage("That password didn't match.", 401);
   }
   return redirect("/orders", [`${COOKIE}=${sessionToken()}; ${cookieAttrs}; Max-Age=${SESSION_DAYS * 86400}`]);
+}
+
+// Mark one order delivered / not delivered. Called by the checkbox via fetch
+// (answers 204) or by a plain form post without JavaScript (redirects back).
+async function setDelivered(event, f) {
+  if (!isSignedIn(event)) return html(401, layout("Signed out", "<p>Please sign in again.</p>"));
+  const orderId = String(f.orderId || "");
+  const delivered = f.delivered === "on";
+  try {
+    await db.send(new UpdateCommand({
+      TableName: ORDERS_TABLE,
+      Key: { orderId },
+      UpdateExpression: delivered ? "SET delivered = :t, deliveredAt = :now" : "SET delivered = :f REMOVE deliveredAt",
+      ConditionExpression: "attribute_exists(orderId)",
+      ExpressionAttributeValues: delivered ? { ":t": true, ":now": new Date().toISOString() } : { ":f": false },
+    }));
+  } catch (e) {
+    if (e.name === "ConditionalCheckFailedException") return html(404, layout("Not found", "<p>Order not found.</p>"));
+    throw e;
+  }
+  return event.headers?.["x-requested-with"] === "fetch"
+    ? { statusCode: 204, headers: SECURITY_HEADERS }
+    : redirect("/orders");
 }
 
 async function adminPage(event) {
@@ -351,7 +412,12 @@ async function adminPage(event) {
   <td>${esc(prettyDate(cutoffFor(id)))}</td><td>${counts[id] || 0} / ${WINDOWS[id].limit}</td></tr>`;
   }).join("");
 
-  const rows = orders.map((o) => `<tr>
+  const rows = orders.map((o) => `<tr${o.delivered ? ' class="done"' : ""}>
+  <td><form method="post" action="/orders" class="deliv">
+    <input type="hidden" name="action" value="delivered"><input type="hidden" name="orderId" value="${esc(o.orderId)}">
+    <input type="checkbox" name="delivered" aria-label="Delivered: ${esc(fullName(o))}, ${esc(prettyDate(o.pickupDate))}"${o.delivered ? " checked" : ""}>
+    <noscript><button type="submit" class="secondary">Save</button></noscript>
+  </form></td>
   <td>${esc(prettyDate(o.pickupDate))}</td><td>${esc(o.boxes ?? "")}</td><td>${esc(fullName(o))}</td>
   <td>${esc(o.phone || o.contact)}${o.contactPref ? ` (${esc(CONTACT_PREFS[o.contactPref])})` : ""}</td>
   <td>${esc(o.location === "home" ? `Home: ${o.address}` : LOCATIONS[o.location] || "")}</td>
@@ -360,11 +426,62 @@ async function adminPage(event) {
   return html(200, layout(`${SHOP} – Orders`, `<h2>Orders (${orders.length}, ${orders.reduce((t, o) => t + (Number(o.boxes) || 0), 0)} boxes)</h2>
 <h3>Delivery weeks</h3>
 <div class="scroll"><table><tr><th>Week</th><th>Order by</th><th>Boxes / limit</th></tr>${summary}</table></div>
-<h3>All orders</h3>
-<div class="scroll"><table><tr><th>Delivery</th><th>Boxes</th><th>Name</th><th>Phone</th><th>Location</th><th>Placed</th></tr>${rows}</table></div>
+<h3>All orders <span class="sub">(<span id="doneCount">${orders.filter((o) => o.delivered).length}</span> of ${orders.length} delivered)</span></h3>
+<div class="scroll"><table><tr><th>Delivered</th><th>Delivery</th><th>Boxes</th><th>Name</th><th>Phone</th><th>Location</th><th>Placed</th></tr>${rows}</table></div>
 <form method="post" action="/orders"><input type="hidden" name="action" value="signout">
-  <button type="submit" class="secondary">Sign out</button></form>`));
+  <button type="submit" class="secondary">Sign out</button></form>
+<script>${ADMIN_JS}</script>`));
 }
+
+// Static so its hash can go in the CSP. Don't put ${...} values in here.
+const ADMIN_JS = `
+  // Save a delivered checkbox as soon as it's clicked; undo it if saving fails.
+  const doneCount = document.getElementById("doneCount");
+  document.querySelectorAll("form.deliv input[type=checkbox]").forEach((box) => {
+    box.addEventListener("change", async () => {
+      const row = box.closest("tr"), form = box.form;
+      row.classList.toggle("done", box.checked);
+      doneCount.textContent = Number(doneCount.textContent) + (box.checked ? 1 : -1);
+      const body = new URLSearchParams(new FormData(form)); // read before disabling: disabled boxes aren't sent
+      box.disabled = true;
+      try {
+        const r = await fetch(form.action, {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded", "x-requested-with": "fetch" },
+          body,
+        });
+        if (!r.ok) throw new Error(r.status === 401 ? "You've been signed out. Please reload and sign in." : "Couldn't save. Please try again.");
+      } catch (e) {
+        box.checked = !box.checked;
+        row.classList.toggle("done", box.checked);
+        doneCount.textContent = Number(doneCount.textContent) + (box.checked ? 1 : -1);
+        alert(e instanceof TypeError ? "Couldn't save. Check your connection." : e.message); // TypeError = network failure
+      } finally {
+        box.disabled = false;
+      }
+    });
+  });
+`;
+
+// Browsers only run the exact scripts/styles above; anything injected is blocked.
+const CSP = [
+  "default-src 'none'",
+  `script-src ${sha256(ORDER_JS)} ${sha256(ADMIN_JS)}`,
+  `style-src ${sha256(CSS)}`,
+  "connect-src 'self'", // delivered checkbox fetch
+  "form-action 'self'",
+  "frame-ancestors 'none'", // no framing (clickjacking)
+  "base-uri 'none'",
+].join("; ");
+
+const SECURITY_HEADERS = {
+  "content-security-policy": CSP,
+  "x-frame-options": "DENY", // older browsers
+  "x-content-type-options": "nosniff",
+  "referrer-policy": "no-referrer",
+  "strict-transport-security": "max-age=31536000",
+  "cache-control": "no-store",
+};
 
 // ---------- entry point ----------
 export const handler = async (event) => {
