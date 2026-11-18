@@ -447,6 +447,10 @@ async function placeOrder(event) {
   if (!Number.isInteger(boxes) || boxes < 1 || boxes > limit) {
     return orderPage("Please choose how many boxes you'd like.", o);
   }
+  // Counted only once the order is valid, so fixing typos doesn't use up the limit.
+  if (await tooManyOrders(event)) {
+    return orderPage("You've placed a lot of orders in a short time. Please wait an hour and try again, or reach out to me directly.", o);
+  }
 
   // Claim the boxes in that week. The condition makes this safe even if two
   // people submit for the last boxes at the same moment.
@@ -522,24 +526,31 @@ const isSignedIn = async (event) => {
   return !!key && sameSecret(value, sessionToken(key));
 };
 
-// Sign-in attempts allowed per IP address per window, counted in DynamoDB so the
-// limit holds across Lambda instances and parallel requests.
-const MAX_ATTEMPTS = 10;
-const ATTEMPT_WINDOW_MIN = 15;
+// Per-IP limits, counted in DynamoDB so they hold across Lambda instances and
+// parallel requests. One row per kind + IP + time window; rows delete themselves.
+const MAX_ATTEMPTS = 10; // sign-in attempts...
+const ATTEMPT_WINDOW_MIN = 15; // ...per 15 minutes
+// Orders per hour. Generous enough for a household sharing one connection, small
+// enough that a script can't claim every box.
+const MAX_ORDERS = 5;
+const ORDER_WINDOW_MIN = 60;
 
-async function tooManyAttempts(event) {
+async function overLimit(event, kind, max, windowMin) {
   // Function URLs report the real connecting IP here (not a client-set header).
   const ip = event.requestContext?.http?.sourceIp || "unknown";
-  const bucket = Math.floor(Date.now() / (ATTEMPT_WINDOW_MIN * 60_000));
+  const bucket = Math.floor(Date.now() / (windowMin * 60_000));
   const r = await db.send(new UpdateCommand({
     TableName: ATTEMPTS_TABLE,
-    Key: { id: `${ip}#${bucket}` },
+    Key: { id: `${kind}#${ip}#${bucket}` },
     UpdateExpression: "ADD attempts :one SET expiresAt = :exp",
-    ExpressionAttributeValues: { ":one": 1, ":exp": (bucket + 2) * ATTEMPT_WINDOW_MIN * 60 },
+    ExpressionAttributeValues: { ":one": 1, ":exp": (bucket + 2) * windowMin * 60 },
     ReturnValues: "UPDATED_NEW",
   }));
-  return r.Attributes.attempts > MAX_ATTEMPTS;
+  return r.Attributes.attempts > max;
 }
+
+const tooManyAttempts = (event) => overLimit(event, "signin", MAX_ATTEMPTS, ATTEMPT_WINDOW_MIN);
+const tooManyOrders = (event) => overLimit(event, "order", MAX_ORDERS, ORDER_WINDOW_MIN);
 
 const redirect = (location, cookies) => ({
   statusCode: 303,
