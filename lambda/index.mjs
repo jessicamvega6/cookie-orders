@@ -1,7 +1,8 @@
 // One Lambda serves everything:
 //   GET  /        -> order form (only shows delivery dates whose week is still open)
 //   POST /        -> place an order
-//   GET  /orders  -> order list for your friend (needs ?key=ADMIN_KEY)
+//   GET  /orders  -> order list for your friend (password page until signed in)
+//   POST /orders  -> sign in with ADMIN_KEY (sets a cookie) or sign out
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
   DynamoDBDocumentClient,
@@ -9,7 +10,7 @@ import {
   UpdateCommand,
   ScanCommand,
 } from "@aws-sdk/lib-dynamodb";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHmac, timingSafeEqual } from "node:crypto";
 
 const db = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 
@@ -100,7 +101,7 @@ const layout = (title, inner) => `<!doctype html>
   fieldset{border:0;padding:0;margin:.9rem 0 0} legend{font-weight:700;margin:0 0 .4rem;padding:0}
   .choices{display:flex;gap:1.5rem} .choices label{display:flex;align-items:center;gap:.4rem;margin:0;font-weight:400}
   .choices input{width:auto;margin:0} .hint{margin:.3rem 0 0;font-size:.9rem;color:var(--brown);font-style:italic} [hidden]{display:none!important}
-  .scroll{overflow-x:auto}
+  .scroll{overflow-x:auto} button.secondary{background:#fff;color:var(--crimson);border:1px solid var(--crimson);width:auto;padding:.4rem 1rem;font-size:.9rem}
   table{border-collapse:collapse;width:100%;font-size:.9rem} th,td{border-bottom:1px solid #e6d8c6;padding:.4rem;text-align:left;vertical-align:top}
   th{background:var(--cream)}
 </style></head><body><main class="card">
@@ -289,9 +290,55 @@ We'll ${contactPref} you at ${esc(phone)} if we have questions.</p>
 <p><a href="/">Place another order</a></p>`));
 }
 
+// ---------- orders-page sign-in ----------
+// The cookie holds a value derived from ADMIN_KEY, never the key itself.
+// Changing admin_key signs everyone out.
+const COOKIE = "bio_admin";
+const SESSION_DAYS = 30;
+const sessionToken = () => createHmac("sha256", ADMIN_KEY).update("orders-session-v1").digest("hex");
+
+const sameSecret = (a, b) => {
+  const x = Buffer.from(String(a)), y = Buffer.from(String(b));
+  return x.length === y.length && timingSafeEqual(x, y);
+};
+
+const isSignedIn = (event) => {
+  if (!ADMIN_KEY) return false;
+  const cookies = event.cookies || (event.headers?.cookie || "").split(/;\s*/);
+  const value = cookies.map((c) => c.split("=")).find(([k]) => k === COOKIE)?.[1];
+  return !!value && sameSecret(value, sessionToken());
+};
+
+const redirect = (location, cookies) => ({
+  statusCode: 303,
+  headers: { location, "cache-control": "no-store" },
+  ...(cookies ? { cookies } : {}),
+});
+
+const cookieAttrs = "Path=/orders; HttpOnly; Secure; SameSite=Strict";
+
+function signInPage(message = "", status = 200) {
+  return html(status, layout(`${SHOP} – Sign in`, `<h2>Orders</h2>
+${message ? `<p class="msg">${esc(message)}</p>` : ""}
+<form method="post" action="/orders">
+  <label for="key">Password</label>
+  <input id="key" name="key" type="password" autocomplete="current-password" required autofocus>
+  <button type="submit">Sign in</button>
+</form>`));
+}
+
+async function ordersPost(event) {
+  const f = parseForm(event);
+  if (f.action === "signout") return redirect("/orders", [`${COOKIE}=; ${cookieAttrs}; Max-Age=0`]);
+  if (!ADMIN_KEY || !sameSecret(f.key || "", ADMIN_KEY)) {
+    await new Promise((r) => setTimeout(r, 1000)); // slow down guessing
+    return signInPage("That password didn't match.", 401);
+  }
+  return redirect("/orders", [`${COOKIE}=${sessionToken()}; ${cookieAttrs}; Max-Age=${SESSION_DAYS * 86400}`]);
+}
+
 async function adminPage(event) {
-  const key = event.queryStringParameters?.key || "";
-  if (!ADMIN_KEY || key !== ADMIN_KEY) return html(403, layout("Forbidden", "<p>Not allowed.</p>"));
+  if (!isSignedIn(event)) return signInPage();
 
   const [orders, counts] = await Promise.all([scanAll(ORDERS_TABLE), getCounts()]);
   orders.sort((a, b) =>
@@ -314,7 +361,9 @@ async function adminPage(event) {
 <h3>Delivery weeks</h3>
 <div class="scroll"><table><tr><th>Week</th><th>Order by</th><th>Boxes / limit</th></tr>${summary}</table></div>
 <h3>All orders</h3>
-<div class="scroll"><table><tr><th>Delivery</th><th>Boxes</th><th>Name</th><th>Phone</th><th>Location</th><th>Placed</th></tr>${rows}</table></div>`));
+<div class="scroll"><table><tr><th>Delivery</th><th>Boxes</th><th>Name</th><th>Phone</th><th>Location</th><th>Placed</th></tr>${rows}</table></div>
+<form method="post" action="/orders"><input type="hidden" name="action" value="signout">
+  <button type="submit" class="secondary">Sign out</button></form>`));
 }
 
 // ---------- entry point ----------
@@ -323,6 +372,7 @@ export const handler = async (event) => {
   const path = event.rawPath || "/";
   try {
     if (path === "/orders" && method === "GET") return await adminPage(event);
+    if (path === "/orders" && method === "POST") return await ordersPost(event);
     if (path !== "/") return html(404, layout("Not found", "<p>Not found.</p>"));
     if (method === "POST") return await placeOrder(event);
     return await orderPage();

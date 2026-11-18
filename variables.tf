@@ -46,7 +46,7 @@ variable "order_cutoff_days" {
 }
 
 variable "admin_key" {
-  description = "Secret for the /orders page. Use a long random string."
+  description = "Password for the /orders page. Use a long random string. Changing it signs everyone out."
   type        = string
   sensitive   = true
 
