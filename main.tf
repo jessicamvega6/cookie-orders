@@ -77,7 +77,7 @@ resource "aws_dynamodb_table" "pickup_counts" {
 
 data "archive_file" "lambda" {
   type        = "zip"
-  source_file = "${path.module}/lambda/index.mjs"
+  source_dir  = "${path.module}/lambda" # index.mjs + fonts/ (served at /fonts/...)
   output_path = "${path.module}/build/lambda.zip"
 }
 
