@@ -68,6 +68,14 @@ const LOCATIONS = {
   kingwood: "Kingwood",
 };
 const CONTACT_PREFS = { call: "Call", text: "Text" };
+const PAY_TYPES = { venmo: "Venmo", paypal: "PayPal", other: "Other" };
+
+// Ways to pay, shown on the order confirmation. Each QR image lives in lambda/images/
+// and is served at its url; bump v1 if an image changes (they're cached for a year).
+const PAYMENTS = [
+  { name: "Venmo", url: "/images/venmo-qr-v1.png", file: "venmo-qr.png" },
+  { name: "PayPal", url: "/images/paypal-qr-v1.png", file: "paypal-qr.png" },
+];
 
 // Keep digits; accept 10 digits or 11 starting with 1. Returns (205) 555-1234 or ""
 // if it can't be a real US number: area code and exchange can't start with 0 or 1,
@@ -91,7 +99,7 @@ const html = (statusCode, body) => ({
 
 const sha256 = (s) => `'sha256-${createHash("sha256").update(s, "utf8").digest("base64")}'`;
 
-// Fonts bundled in the zip and served by this Lambda (see FONTS near the bottom).
+// Fonts bundled in the zip and served by this Lambda (see STATIC near the bottom).
 // Dancing Script: SIL Open Font License, see lambda/fonts/OFL.txt.
 const FONT_URL = "/fonts/dancing-script-v1.woff2"; // bump v1 if the file ever changes (it's cached for a year)
 
@@ -181,6 +189,13 @@ const CSS = `
   button.secondary{width:auto;justify-self:start;margin-top:18px;font:700 14px var(--body);letter-spacing:0;color:var(--crimson);background:#fff;border:2px solid var(--crimson);
     padding:6px 16px;box-shadow:2px 2px 0 rgba(107,74,51,.35)}
   button.secondary:hover{background:var(--cream)}
+  /* payment QR codes on the confirmation: always side by side, shrinking on small screens */
+  .pay{margin-top:26px}
+  .pay .tagline{margin:14px 0 16px}
+  .qrs{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(0,220px);justify-content:center;gap:14px}
+  .qrs figure{margin:0;padding:10px 10px 6px;background:#fff;border:2px solid var(--ink);border-radius:10px;box-shadow:3px 3px 0 rgba(107,74,51,.35);text-align:center;min-width:0}
+  .qrs img{display:block;width:100%;height:auto}
+  .qrs figcaption{margin-top:6px;font-weight:700;font-size:14px;letter-spacing:.2px;color:var(--brown)}
   .signoff{text-align:center;font-family:var(--hand);color:var(--brown);font-size:18px;margin:18px 0 0}
 
   /* orders page */
@@ -364,6 +379,13 @@ async function orderPage(message = "", values = {}) {
     </div>
   </div>
   <div class="field">
+    <label for="paymentType">Payment type you have or will be using</label>
+    <select id="paymentType" name="paymentType" required>
+      <option value="">Pick one</option>
+      ${Object.entries(PAY_TYPES).map(([v, label]) => `<option value="${v}"${values.paymentType === v ? " selected" : ""}>${label}</option>`).join("")}
+    </select>
+  </div>
+  <div class="field">
     <label for="notes">Anything else I should know? <span class="opt">(optional)</span></label>
     <textarea id="notes" name="notes" maxlength="500" placeholder="Allergies, gate codes, a note for the box&hellip;">${esc(values.notes)}</textarea>
   </div>
@@ -433,13 +455,14 @@ async function placeOrder(event) {
   const firstName = (o.firstName || "").trim().slice(0, 50);
   const lastName = (o.lastName || "").trim().slice(0, 50);
   const phone = formatPhone(o.phone);
-  const contactPref = o.contactPref in CONTACT_PREFS ? o.contactPref : "";
-  const location = o.location in LOCATIONS ? o.location : "";
+  const contactPref = Object.hasOwn(CONTACT_PREFS, o.contactPref ?? "") ? o.contactPref : "";
+  const location = Object.hasOwn(LOCATIONS, o.location ?? "") ? o.location : "";
   const home = location === "home";
   const clean = (v, n) => (home ? String(v || "").trim().replace(/\s+/g, " ").slice(0, n) : "");
   const street = clean(o.street, 100), unit = clean(o.unit, 40), city = clean(o.city, 60), zip = clean(o.zip, 10);
   // One line for the confirmation and the orders page, e.g. "123 Oak St, Apt 4B, Hoover, AL 35226".
   const address = home ? [street, unit, `${city}, AL ${zip}`].filter(Boolean).join(", ") : "";
+  const paymentType = Object.hasOwn(PAY_TYPES, o.paymentType ?? "") ? o.paymentType : "";
   const notes = String(o.notes || "").replace(/\r\n?/g, "\n").trim().slice(0, 500);
   const pickupDate = o.pickupDate || "";
   const boxes = Number(o.boxes);
@@ -450,6 +473,7 @@ async function placeOrder(event) {
   if (!phone) return orderPage("Please enter a valid 10-digit US phone number, including area code.", o);
   if (!contactPref) return orderPage("Please choose call or text.", o);
   if (!location) return orderPage("Please pick a delivery location.", o);
+  if (!paymentType) return orderPage("Please pick how you'll pay.", o);
   if (home && (!street || !city)) return orderPage("Please enter your street address and city.", o);
   if (home && !/^\d{5}(-\d{4})?$/.test(zip)) return orderPage("Please enter a 5-digit ZIP code.", o);
   const windowId = DATE_TO_WINDOW[pickupDate];
@@ -493,7 +517,7 @@ async function placeOrder(event) {
     Item: {
       orderId: randomUUID(),
       createdAt: new Date().toISOString(),
-      pickupDate, boxes, firstName, lastName, phone, contactPref, location, address, street, unit, city, zip, notes,
+      pickupDate, boxes, firstName, lastName, phone, contactPref, location, address, street, unit, city, zip, paymentType, notes,
       // DynamoDB TTL (epoch seconds): deleted RETENTION_DAYS after the delivery date.
       expiresAt: Math.floor(Date.parse(`${minusDays(pickupDate, -RETENTION_DAYS)}T23:59:59Z`) / 1000),
     },
@@ -503,6 +527,11 @@ async function placeOrder(event) {
   return html(200, layout(SHOP, `<h2>Thanks, ${esc(firstName)}!</h2>
 <p class="msg">Your order for <strong>${boxes} box${boxes === 1 ? "" : "es"}</strong> is in for delivery on <strong>${esc(prettyDate(pickupDate))}</strong> to <strong>${esc(where)}</strong>.
 I'll ${contactPref} you at ${esc(phone)} if I have questions.</p>
+<section class="pay">
+<h3 class="divider">payment</h3>
+<p class="tagline">If you haven&rsquo;t already, please use one of the below ways to pay!</p>
+<div class="qrs">${PAYMENTS.map((p) => `<figure><img src="${p.url}" width="220" height="220" alt="${esc(p.name)} QR code"><figcaption>${esc(p.name)}</figcaption></figure>`).join("")}</div>
+</section>
 <p><a href="/">Place another order</a></p>`));
 }
 
@@ -726,7 +755,7 @@ async function adminPage(event) {
   </form></td>`;
 
   const rows = (list) => list.map((o) => `<tr${o.cancelled ? ' class="cancelled"' : o.delivered ? ' class="done"' : ""}>
-  ${flagCell(o, "delivered")}${flagCell(o, "paid")}
+  ${flagCell(o, "delivered")}${flagCell(o, "paid")}<td>${esc(PAY_TYPES[o.paymentType] || "")}</td>
   <td>${esc(prettyDate(o.pickupDate))}</td><td>${esc(o.boxes ?? "")}</td><td>${esc(fullName(o))}</td>
   <td>${esc(o.phone || o.contact)}${o.contactPref ? ` (${esc(CONTACT_PREFS[o.contactPref])})` : ""}</td>
   <td>${esc(o.location === "home" ? `Home: ${o.address}` : LOCATIONS[o.location] || "")}</td>
@@ -750,7 +779,7 @@ async function adminPage(event) {
     return `<section>
 <div class="sechead"><h2>${esc(title)}</h2>${dates ? `<span class="dates">${esc(dates)}</span>` : ""}<span class="sub">${counts}</span></div>
 ${list.length
-  ? `<div class="scroll"><table><tr><th>Delivered</th><th>Paid</th><th>Delivery</th><th>Boxes</th><th>Name</th><th>Phone</th><th>Location</th><th>Notes</th><th>Placed</th><th></th></tr>${rows(list)}</table></div>`
+  ? `<div class="scroll"><table><tr><th>Delivered</th><th>Paid</th><th>Pays with</th><th>Delivery</th><th>Boxes</th><th>Name</th><th>Phone</th><th>Location</th><th>Notes</th><th>Placed</th><th></th></tr>${rows(list)}</table></div>`
   : `<p class="sortnote">${esc(emptyText)}</p>`}
 </section>`;
   };
@@ -821,6 +850,7 @@ const CSP = [
   `script-src ${sha256(ORDER_JS)} ${sha256(ADMIN_JS)}`,
   `style-src ${sha256(CSS)}`,
   "font-src 'self'", // Dancing Script, served from /fonts/
+  "img-src 'self'", // payment QR codes, served from /images/
   "connect-src 'self'", // delivered/paid checkbox fetch
   "form-action 'self'",
   "frame-ancestors 'none'", // no framing (clickjacking)
@@ -836,16 +866,18 @@ const SECURITY_HEADERS = {
   "cache-control": "no-store",
 };
 
-// Font files served from the zip, read once when the Lambda starts. Versioned URLs,
-// so browsers can cache them for a year.
-const FONTS = {
-  [FONT_URL]: readFileSync(new URL("./fonts/dancing-script-latin.woff2", import.meta.url)).toString("base64"),
+// Font and image files served from the zip, read once when the Lambda starts.
+// Versioned URLs, so browsers can cache them for a year.
+const fileFromZip = (rel, type) => ({ type, body: readFileSync(new URL(rel, import.meta.url)).toString("base64") });
+const STATIC = {
+  [FONT_URL]: fileFromZip("./fonts/dancing-script-latin.woff2", "font/woff2"),
+  ...Object.fromEntries(PAYMENTS.map((p) => [p.url, fileFromZip(`./images/${p.file}`, "image/png")])),
 };
 
-const font = (path) => ({
+const staticFile = (path) => ({
   statusCode: 200,
-  headers: { ...SECURITY_HEADERS, "content-type": "font/woff2", "cache-control": "public, max-age=31536000, immutable" },
-  body: FONTS[path],
+  headers: { ...SECURITY_HEADERS, "content-type": STATIC[path].type, "cache-control": "public, max-age=31536000, immutable" },
+  body: STATIC[path].body,
   isBase64Encoded: true,
 });
 
@@ -854,7 +886,7 @@ export const handler = async (event) => {
   const method = event.requestContext?.http?.method || "GET";
   const path = event.rawPath || "/";
   try {
-    if (Object.hasOwn(FONTS, path) && method === "GET") return font(path);
+    if (Object.hasOwn(STATIC, path) && method === "GET") return staticFile(path);
     if (path === "/orders" && method === "GET") return await adminPage(event);
     if (path === "/orders" && method === "POST") return await ordersPost(event);
     if (path !== "/") return html(404, layout("Not found", "<p>Not found.</p>"));
