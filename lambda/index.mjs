@@ -197,6 +197,7 @@ const CSS = `
   .qrs img{display:block;width:100%;height:auto}
   .qrs figcaption{margin-top:6px;font-weight:700;font-size:14px;letter-spacing:.2px;color:var(--brown)}
   .signoff{text-align:center;font-family:var(--hand);color:var(--brown);font-size:18px;margin:18px 0 0}
+  .after{text-align:center;font-family:var(--hand);font-size:22px;font-weight:700;margin:8px 0 0}
 
   /* orders page */
   .scroll{overflow-x:auto;background:#fff;border:2px solid var(--ink);border-radius:10px;box-shadow:3px 3px 0 rgba(107,74,51,.35)}
@@ -250,8 +251,8 @@ const shopTitle = () => {
     : esc(SHOP);
 };
 
-// wide: roomier card for the orders table
-const layout = (title, inner, { wide = false } = {}) => `<!doctype html>
+// wide: roomier card for the orders table. after: html under the sign-off.
+const layout = (title, inner, { wide = false, after = "" } = {}) => `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${esc(title)}</title>
@@ -264,7 +265,7 @@ ${COOKIES_SVG}
 </header>
 ${inner}
 <p class="signoff">baked with love (and extra butter)</p>
-</main></div></body></html>`;
+${after}</main></div></body></html>`;
 
 async function scanAll(TableName) {
   const items = [];
@@ -531,8 +532,7 @@ I'll ${contactPref} you at ${esc(phone)} if I have questions.</p>
 <h3 class="divider">payment</h3>
 <p class="tagline">If you haven&rsquo;t already, please use one of the below ways to pay!</p>
 <div class="qrs">${PAYMENTS.map((p) => `<figure><img src="${p.url}" width="220" height="220" alt="${esc(p.name)} QR code"><figcaption>${esc(p.name)}</figcaption></figure>`).join("")}</div>
-</section>
-<p><a href="/">Place another order</a></p>`));
+</section>`, { after: `<p class="after"><a href="/">Place another order</a></p>` }));
 }
 
 // ---------- orders-page sign-in ----------
