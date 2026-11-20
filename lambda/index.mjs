@@ -2,11 +2,13 @@
 //   GET  /        -> order form (only shows delivery dates whose week is still open)
 //   POST /        -> place an order
 //   GET  /orders  -> order list for your friend (password page until signed in)
-//   POST /orders  -> sign in with the admin password (sets a cookie), sign out, or mark delivered
+//   POST /orders  -> sign in with the admin password (sets a cookie), sign out, mark delivered / paid, or cancel
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
   DynamoDBDocumentClient,
   PutCommand,
+  GetCommand,
+  TransactWriteCommand,
   UpdateCommand,
   ScanCommand,
 } from "@aws-sdk/lib-dynamodb";
@@ -141,13 +143,14 @@ const CSS = `
   @media (max-width:420px){.row{grid-template-columns:1fr;gap:18px}}
   .field{display:grid;gap:6px;min-width:0}
   label,legend{font-weight:700;font-size:14px;letter-spacing:.2px;color:var(--brown)}
-  input:not([type=radio]):not([type=checkbox]):not([type=hidden]),select{width:100%;font:16px/1.3 var(--body);color:var(--ink);background:#fff;
+  input:not([type=radio]):not([type=checkbox]):not([type=hidden]),select,textarea{width:100%;font:16px/1.3 var(--body);color:var(--ink);background:#fff;
     border:2px solid var(--ink);border-radius:10px;padding:11px 12px;box-shadow:3px 3px 0 rgba(107,74,51,.35);appearance:none;-webkit-appearance:none}
-  input::placeholder{color:#8a7d70}
+  textarea{min-height:96px;resize:vertical}
+  input::placeholder,textarea::placeholder{color:#8a7d70}
   select{padding-right:40px;background-image:linear-gradient(45deg,transparent 50%,var(--crimson) 50%),linear-gradient(135deg,var(--crimson) 50%,transparent 50%);
     background-position:calc(100% - 20px) 50%,calc(100% - 14px) 50%;background-size:6px 6px,6px 6px;background-repeat:no-repeat}
   select:disabled{color:#8a7d70;background-color:#f6f3ee}
-  input:focus,select:focus{outline:3px solid var(--gold);outline-offset:2px;border-color:var(--crimson)}
+  input:focus,select:focus,textarea:focus{outline:3px solid var(--gold);outline-offset:2px;border-color:var(--crimson)}
   input[aria-invalid=true]{border-color:var(--crimson)}
   fieldset{border:0;margin:0;padding:0;min-width:0}
   legend{padding:0;margin-bottom:8px}
@@ -187,8 +190,12 @@ const CSS = `
   tr:last-child td{border-bottom:0}
   th{background:var(--cream);color:var(--brown)}
   tr.done td{color:#8a8178;background:#f6f3ee}
+  tr.cancelled td{color:#8a8178;background:#f6f3ee;text-decoration:line-through}
+  tr.cancelled td.act{text-decoration:none;font-style:italic}
+  button.small{margin:0;white-space:nowrap}
   .sub{font-size:14px;font-weight:400;color:var(--brown)}
   .deliv{display:block;margin:0;text-align:center}
+  .notes{white-space:pre-wrap;min-width:160px}
   .deliv input[type=checkbox]{width:22px;height:22px;margin:0;accent-color:var(--crimson);cursor:pointer}
 
   @media (min-width:700px){
@@ -352,6 +359,10 @@ async function orderPage(message = "", values = {}) {
       </div>
     </div>
   </div>
+  <div class="field">
+    <label for="notes">Anything else I should know? <span class="opt">(optional)</span></label>
+    <textarea id="notes" name="notes" maxlength="500" placeholder="Allergies, gate codes, a note for the box&hellip;">${esc(values.notes)}</textarea>
+  </div>
   <input class="hp" name="website" tabindex="-1" autocomplete="off" aria-hidden="true">
   <button type="submit">Place order ${HEART_SVG}</button>
 </form>
@@ -425,6 +436,7 @@ async function placeOrder(event) {
   const street = clean(o.street, 100), unit = clean(o.unit, 40), city = clean(o.city, 60), zip = clean(o.zip, 10);
   // One line for the confirmation and the orders page, e.g. "123 Oak St, Apt 4B, Hoover, AL 35226".
   const address = home ? [street, unit, `${city}, AL ${zip}`].filter(Boolean).join(", ") : "";
+  const notes = String(o.notes || "").replace(/\r\n?/g, "\n").trim().slice(0, 500);
   const pickupDate = o.pickupDate || "";
   const boxes = Number(o.boxes);
 
@@ -477,7 +489,7 @@ async function placeOrder(event) {
     Item: {
       orderId: randomUUID(),
       createdAt: new Date().toISOString(),
-      pickupDate, boxes, firstName, lastName, phone, contactPref, location, address, street, unit, city, zip,
+      pickupDate, boxes, firstName, lastName, phone, contactPref, location, address, street, unit, city, zip, notes,
       // DynamoDB TTL (epoch seconds): deleted RETENTION_DAYS after the delivery date.
       expiresAt: Math.floor(Date.parse(`${minusDays(pickupDate, -RETENTION_DAYS)}T23:59:59Z`) / 1000),
     },
@@ -573,7 +585,8 @@ ${message ? `<p class="msg">${esc(message)}</p>` : ""}
 async function ordersPost(event) {
   const f = parseForm(event);
   if (f.action === "signout") return redirect("/orders", [`${COOKIE}=; ${cookieAttrs}; Max-Age=0`]);
-  if (f.action === "delivered") return setDelivered(event, f);
+  if (Object.hasOwn(FLAGS, f.action ?? "")) return setFlag(event, f, f.action);
+  if (f.action === "cancel") return cancelOrder(event, f);
   if (await tooManyAttempts(event)) {
     return signInPage(`Too many sign-in attempts. Please wait ${ATTEMPT_WINDOW_MIN} minutes and try again.`, 429);
   }
@@ -585,19 +598,23 @@ async function ordersPost(event) {
   return redirect("/orders", [`${COOKIE}=${sessionToken(key)}; ${cookieAttrs}; Max-Age=${SESSION_DAYS * 86400}`]);
 }
 
-// Mark one order delivered / not delivered. Called by the checkbox via fetch
+// Checkbox columns on the orders page. Each saves <field> and <field>At on the order.
+const FLAGS = { delivered: "Delivered", paid: "Paid" };
+
+// Mark one order delivered/paid or not. Called by the checkbox via fetch
 // (answers 204) or by a plain form post without JavaScript (redirects back).
-async function setDelivered(event, f) {
+async function setFlag(event, f, field) {
   if (!(await isSignedIn(event))) return html(401, layout("Signed out", "<p>Please sign in again.</p>"));
   const orderId = String(f.orderId || "");
-  const delivered = f.delivered === "on";
+  const on = f[field] === "on";
   try {
     await db.send(new UpdateCommand({
       TableName: ORDERS_TABLE,
       Key: { orderId },
-      UpdateExpression: delivered ? "SET delivered = :t, deliveredAt = :now" : "SET delivered = :f REMOVE deliveredAt",
+      UpdateExpression: on ? "SET #f = :t, #at = :now" : "SET #f = :f REMOVE #at",
       ConditionExpression: "attribute_exists(orderId)",
-      ExpressionAttributeValues: delivered ? { ":t": true, ":now": new Date().toISOString() } : { ":f": false },
+      ExpressionAttributeNames: { "#f": field, "#at": `${field}At` },
+      ExpressionAttributeValues: on ? { ":t": true, ":now": new Date().toISOString() } : { ":f": false },
     }));
   } catch (e) {
     if (e.name === "ConditionalCheckFailedException") return html(404, layout("Not found", "<p>Order not found.</p>"));
@@ -606,6 +623,55 @@ async function setDelivered(event, f) {
   return event.headers?.["x-requested-with"] === "fetch"
     ? { statusCode: 204, headers: SECURITY_HEADERS }
     : redirect("/orders");
+}
+
+// Cancel an order and give its boxes back to its week, so the week can take more
+// orders (if it's still before the cutoff). Both writes happen together or not at
+// all, and an order can only be cancelled once, so boxes are never returned twice.
+async function cancelOrder(event, f) {
+  if (!(await isSignedIn(event))) return html(401, layout("Signed out", "<p>Please sign in again.</p>"));
+  const orderId = String(f.orderId || "");
+  const { Item: o } = await db.send(new GetCommand({ TableName: ORDERS_TABLE, Key: { orderId } }));
+  if (!o) return html(404, layout("Not found", "<p>Order not found.</p>"));
+  if (o.cancelled) return redirect("/orders");
+  if (o.delivered) {
+    return html(409, layout("Can't cancel", `<p class="msg">That order was already delivered, so it can't be cancelled. Uncheck Delivered first if that was a mistake.</p>
+<p><a href="/orders">Back to orders</a></p>`));
+  }
+
+  const boxes = Number(o.boxes) || 0;
+  const windowId = DATE_TO_WINDOW[o.pickupDate]; // undefined if the week was removed from the config
+  const markCancelled = {
+    Update: {
+      TableName: ORDERS_TABLE,
+      Key: { orderId },
+      UpdateExpression: "SET cancelled = :t, cancelledAt = :now",
+      // not already cancelled, and not delivered (checked again here in case it was ticked just now)
+      ConditionExpression: "attribute_exists(orderId) AND (attribute_not_exists(cancelled) OR cancelled = :f) AND (attribute_not_exists(delivered) OR delivered = :f)",
+      ExpressionAttributeValues: { ":t": true, ":f": false, ":now": new Date().toISOString() },
+    },
+  };
+  const returnBoxes = windowId && boxes > 0 && {
+    Update: {
+      TableName: COUNTS_TABLE,
+      Key: { pickupDate: windowId },
+      UpdateExpression: "ADD orderCount :n",
+      ConditionExpression: "orderCount >= :b", // never go below zero
+      ExpressionAttributeValues: { ":n": -boxes, ":b": boxes },
+    },
+  };
+  try {
+    await db.send(new TransactWriteCommand({ TransactItems: [markCancelled, returnBoxes].filter(Boolean) }));
+  } catch (e) {
+    if (e.name !== "TransactionCanceledException") throw e;
+    // Already cancelled or delivered meanwhile: change nothing; the reloaded page shows its state.
+    // The count was off: just mark it cancelled, don't touch the count.
+    const [orderReason, countReason] = (e.CancellationReasons || []).map((x) => x?.Code);
+    if (orderReason === "ConditionalCheckFailed") return redirect("/orders");
+    if (countReason === "ConditionalCheckFailed") await db.send(new UpdateCommand(markCancelled.Update));
+    else throw e;
+  }
+  return redirect("/orders");
 }
 
 async function adminPage(event) {
@@ -622,23 +688,37 @@ async function adminPage(event) {
   <td>${esc(prettyDate(cutoffFor(id)))}</td><td>${counts[id] || 0} / ${WINDOWS[id].limit}</td></tr>`;
   }).join("");
 
-  const rows = orders.map((o) => `<tr${o.delivered ? ' class="done"' : ""}>
-  <td><form method="post" action="/orders" class="deliv">
-    <input type="hidden" name="action" value="delivered"><input type="hidden" name="orderId" value="${esc(o.orderId)}">
-    <input type="checkbox" name="delivered" aria-label="Delivered: ${esc(fullName(o))}, ${esc(prettyDate(o.pickupDate))}"${o.delivered ? " checked" : ""}>
+  const flagCell = (o, field) => o.cancelled ? `<td>${o[field] ? FLAGS[field] : ""}</td>` : `<td><form method="post" action="/orders" class="deliv">
+    <input type="hidden" name="action" value="${field}"><input type="hidden" name="orderId" value="${esc(o.orderId)}">
+    <input type="checkbox" name="${field}" aria-label="${FLAGS[field]}: ${esc(fullName(o))}, ${esc(prettyDate(o.pickupDate))}"${o[field] ? " checked" : ""}>
     <noscript><button type="submit" class="secondary">Save</button></noscript>
-  </form></td>
+  </form></td>`;
+
+  const cancelCell = (o) => o.cancelled
+    ? `<td class="act">Cancelled</td>`
+    : `<td class="act"><form method="post" action="/orders" class="cancel">
+    <input type="hidden" name="action" value="cancel"><input type="hidden" name="orderId" value="${esc(o.orderId)}">
+    <button type="submit" class="secondary small"${o.delivered ? " hidden" : ""} data-who="${esc(`${fullName(o)}'s ${o.boxes}-box order for ${prettyDate(o.pickupDate)}`)}">Cancel</button>
+  </form></td>`;
+
+  const rows = orders.map((o) => `<tr${o.cancelled ? ' class="cancelled"' : o.delivered ? ' class="done"' : ""}>
+  ${flagCell(o, "delivered")}${flagCell(o, "paid")}
   <td>${esc(prettyDate(o.pickupDate))}</td><td>${esc(o.boxes ?? "")}</td><td>${esc(fullName(o))}</td>
   <td>${esc(o.phone || o.contact)}${o.contactPref ? ` (${esc(CONTACT_PREFS[o.contactPref])})` : ""}</td>
   <td>${esc(o.location === "home" ? `Home: ${o.address}` : LOCATIONS[o.location] || "")}</td>
-  <td>${esc(new Date(o.createdAt).toLocaleString("en-US", { timeZone: TZ }))}</td></tr>`).join("");
+  <td class="notes">${esc(o.notes)}</td>
+  <td>${esc(new Date(o.createdAt).toLocaleString("en-US", { timeZone: TZ }))}</td>
+  ${cancelCell(o)}</tr>`).join("");
 
-  const totalBoxes = orders.reduce((t, o) => t + (Number(o.boxes) || 0), 0);
-  return html(200, layout(`${SHOP} – Orders`, `<h2>Orders (${orders.length}, ${totalBoxes} box${totalBoxes === 1 ? "" : "es"})</h2>
+  // Totals leave out cancelled orders.
+  const active = orders.filter((o) => !o.cancelled);
+  const cancelledCount = orders.length - active.length;
+  const totalBoxes = active.reduce((t, o) => t + (Number(o.boxes) || 0), 0);
+  return html(200, layout(`${SHOP} – Orders`, `<h2>Orders (${active.length}, ${totalBoxes} box${totalBoxes === 1 ? "" : "es"})</h2>
 <h3>Delivery weeks</h3>
 <div class="scroll"><table><tr><th>Week</th><th>Order by</th><th>Boxes / limit</th></tr>${summary}</table></div>
-<h3>All orders <span class="sub">(<span id="doneCount">${orders.filter((o) => o.delivered).length}</span> of ${orders.length} delivered)</span></h3>
-<div class="scroll"><table><tr><th>Delivered</th><th>Delivery</th><th>Boxes</th><th>Name</th><th>Phone</th><th>Location</th><th>Placed</th></tr>${rows}</table></div>
+<h3>All orders <span class="sub">(<span id="deliveredCount">${active.filter((o) => o.delivered).length}</span> delivered, <span id="paidCount">${active.filter((o) => o.paid).length}</span> paid, of ${active.length}${cancelledCount ? `; ${cancelledCount} cancelled` : ""})</span></h3>
+<div class="scroll"><table><tr><th>Delivered</th><th>Paid</th><th>Delivery</th><th>Boxes</th><th>Name</th><th>Phone</th><th>Location</th><th>Notes</th><th>Placed</th><th></th></tr>${rows}</table></div>
 <form method="post" action="/orders"><input type="hidden" name="action" value="signout">
   <button type="submit" class="secondary">Sign out</button></form>
 <script>${ADMIN_JS}</script>`, { wide: true }));
@@ -646,13 +726,20 @@ async function adminPage(event) {
 
 // Static so its hash can go in the CSP. Don't put ${...} values in here.
 const ADMIN_JS = `
-  // Save a delivered checkbox as soon as it's clicked; undo it if saving fails.
-  const doneCount = document.getElementById("doneCount");
+  // Save a delivered/paid checkbox as soon as it's clicked; undo it if saving fails.
   document.querySelectorAll("form.deliv input[type=checkbox]").forEach((box) => {
+    const count = document.getElementById(box.name + "Count");
+    // Delivered orders can't be cancelled, so hide that row's Cancel button.
+    const cancel = box.closest("tr").querySelector("form.cancel button");
+    const show = () => {
+      if (box.name !== "delivered") return;
+      box.closest("tr").classList.toggle("done", box.checked);
+      if (cancel) cancel.hidden = box.checked;
+    };
     box.addEventListener("change", async () => {
-      const row = box.closest("tr"), form = box.form;
-      row.classList.toggle("done", box.checked);
-      doneCount.textContent = Number(doneCount.textContent) + (box.checked ? 1 : -1);
+      const form = box.form;
+      show();
+      count.textContent = Number(count.textContent) + (box.checked ? 1 : -1);
       const body = new URLSearchParams(new FormData(form)); // read before disabling: disabled boxes aren't sent
       box.disabled = true;
       try {
@@ -665,12 +752,20 @@ const ADMIN_JS = `
         if (!r.ok) throw new Error(r.status === 401 ? "You've been signed out. Please reload and sign in." : "Couldn't save. Please try again.");
       } catch (e) {
         box.checked = !box.checked;
-        row.classList.toggle("done", box.checked);
-        doneCount.textContent = Number(doneCount.textContent) + (box.checked ? 1 : -1);
+        show();
+        count.textContent = Number(count.textContent) + (box.checked ? 1 : -1);
         alert(e instanceof TypeError ? "Couldn't save. Check your connection." : e.message); // TypeError = network failure
       } finally {
         box.disabled = false;
       }
+    });
+  });
+
+  // Cancelling can't be undone, so ask first.
+  document.querySelectorAll("form.cancel").forEach((form) => {
+    form.addEventListener("submit", (e) => {
+      const who = form.querySelector("button").dataset.who;
+      if (!confirm("Cancel " + who + "? Its boxes go back to that week. This can't be undone.")) e.preventDefault();
     });
   });
 `;
@@ -681,7 +776,7 @@ const CSP = [
   `script-src ${sha256(ORDER_JS)} ${sha256(ADMIN_JS)}`,
   `style-src ${sha256(CSS)}`,
   "font-src 'self'", // Dancing Script, served from /fonts/
-  "connect-src 'self'", // delivered checkbox fetch
+  "connect-src 'self'", // delivered/paid checkbox fetch
   "form-action 'self'",
   "frame-ancestors 'none'", // no framing (clickjacking)
   "base-uri 'none'",
