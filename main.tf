@@ -102,7 +102,7 @@ resource "aws_iam_role_policy" "lambda" {
     Statement = [
       {
         Effect   = "Allow"
-        Action   = ["dynamodb:PutItem", "dynamodb:Scan", "dynamodb:UpdateItem"] # UpdateItem: delivered checkbox
+        Action   = ["dynamodb:PutItem", "dynamodb:Scan", "dynamodb:UpdateItem", "dynamodb:GetItem"] # UpdateItem: checkboxes and cancel; GetItem: cancel
         Resource = aws_dynamodb_table.orders.arn
       },
       {
