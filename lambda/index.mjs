@@ -194,6 +194,10 @@ const CSS = `
   tr.cancelled td.act{text-decoration:none;font-style:italic}
   button.small{margin:0;white-space:nowrap}
   .sub{font-size:14px;font-weight:400;color:var(--brown)}
+  .sechead{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 14px;border-bottom:2px dashed rgba(163,41,58,.5);padding-bottom:6px;margin:30px 0 8px}
+  .sechead h2{margin:0;font-size:30px}
+  .sechead .dates{font-weight:700;font-size:15px;color:var(--brown)}
+  .sortnote{margin:0 0 10px;font-style:italic;font-size:14px;color:var(--brown)}
   .deliv{display:block;margin:0;text-align:center}
   .notes{white-space:pre-wrap;min-width:160px}
   .deliv input[type=checkbox]{width:22px;height:22px;margin:0;accent-color:var(--crimson);cursor:pointer}
@@ -678,9 +682,29 @@ async function adminPage(event) {
   if (!(await isSignedIn(event))) return signInPage();
 
   const [orders, counts] = await Promise.all([scanAll(ORDERS_TABLE), getCounts()]);
-  orders.sort((a, b) =>
-    (a.pickupDate + a.createdAt).localeCompare(b.pickupDate + b.createdAt)
-  );
+
+  // "This week" is the first delivery week that isn't over yet. Orders before it go
+  // under Earlier, orders after it under Upcoming.
+  const now = today();
+  const weeks = Object.keys(WINDOWS).sort().map((id) => [...WINDOWS[id].dates].sort());
+  const thisWeek = weeks.find((ds) => ds[ds.length - 1] >= now);
+  const weekStart = thisWeek?.[0] ?? now, weekEnd = thisWeek?.[thisWeek.length - 1];
+  const due = [], upcoming = [], earlier = [];
+  for (const o of orders) {
+    const d = o.pickupDate || "";
+    (d < weekStart ? earlier : weekEnd && d <= weekEnd ? due : upcoming).push(o);
+  }
+
+  // Locations sort in the order the form lists them.
+  const locRank = (o) => { const i = Object.keys(LOCATIONS).indexOf(o.location); return i < 0 ? 99 : i; };
+  const byDate = (a, b) => (a.pickupDate || "").localeCompare(b.pickupDate || "");
+  const byLoc = (a, b) => locRank(a) - locRank(b);
+  const byPlaced = (a, b) => (a.createdAt || "").localeCompare(b.createdAt || "");
+  // Within each section: still to deliver first, then delivered, then cancelled.
+  const byStatus = (a, b) => (a.cancelled ? 2 : a.delivered ? 1 : 0) - (b.cancelled ? 2 : b.delivered ? 1 : 0);
+  due.sort((a, b) => byStatus(a, b) || byLoc(a, b) || byDate(a, b) || byPlaced(a, b));
+  upcoming.sort((a, b) => byStatus(a, b) || byDate(a, b) || byLoc(a, b) || byPlaced(a, b));
+  earlier.sort((a, b) => byStatus(a, b) || byDate(a, b) || byLoc(a, b) || byPlaced(a, b));
 
   const summary = Object.keys(WINDOWS).sort().map((id) => {
     const ds = [...WINDOWS[id].dates].sort();
@@ -701,7 +725,7 @@ async function adminPage(event) {
     <button type="submit" class="secondary small"${o.delivered ? " hidden" : ""} data-who="${esc(`${fullName(o)}'s ${o.boxes}-box order for ${prettyDate(o.pickupDate)}`)}">Cancel</button>
   </form></td>`;
 
-  const rows = orders.map((o) => `<tr${o.cancelled ? ' class="cancelled"' : o.delivered ? ' class="done"' : ""}>
+  const rows = (list) => list.map((o) => `<tr${o.cancelled ? ' class="cancelled"' : o.delivered ? ' class="done"' : ""}>
   ${flagCell(o, "delivered")}${flagCell(o, "paid")}
   <td>${esc(prettyDate(o.pickupDate))}</td><td>${esc(o.boxes ?? "")}</td><td>${esc(fullName(o))}</td>
   <td>${esc(o.phone || o.contact)}${o.contactPref ? ` (${esc(CONTACT_PREFS[o.contactPref])})` : ""}</td>
@@ -711,14 +735,33 @@ async function adminPage(event) {
   ${cancelCell(o)}</tr>`).join("");
 
   // Totals leave out cancelled orders.
+  const boxCount = (list) => list.reduce((t, o) => t + (Number(o.boxes) || 0), 0);
+  const plural = (n, word, many = `${word}s`) => `${n} ${n === 1 ? word : many}`;
   const active = orders.filter((o) => !o.cancelled);
-  const cancelledCount = orders.length - active.length;
-  const totalBoxes = active.reduce((t, o) => t + (Number(o.boxes) || 0), 0);
-  return html(200, layout(`${SHOP} – Orders`, `<h2>Orders (${active.length}, ${totalBoxes} box${totalBoxes === 1 ? "" : "es"})</h2>
+
+  // One section: heading, live counts (the checkbox script updates the data-count
+  // spans), and the table.
+  const section = (title, dates, list, emptyText) => {
+    const live = list.filter((o) => !o.cancelled);
+    const cancelled = list.length - live.length;
+    const counts = live.length
+      ? `${plural(live.length, "order")} · ${plural(boxCount(live), "box", "boxes")} · <span data-count="delivered" data-dir="-1">${live.filter((o) => !o.delivered).length}</span> to deliver · <span data-count="paid" data-dir="1">${live.filter((o) => o.paid).length}</span> paid${cancelled ? ` · ${cancelled} cancelled` : ""}`
+      : cancelled ? `${cancelled} cancelled` : "";
+    return `<section>
+<div class="sechead"><h2>${esc(title)}</h2>${dates ? `<span class="dates">${esc(dates)}</span>` : ""}<span class="sub">${counts}</span></div>
+${list.length
+  ? `<div class="scroll"><table><tr><th>Delivered</th><th>Paid</th><th>Delivery</th><th>Boxes</th><th>Name</th><th>Phone</th><th>Location</th><th>Notes</th><th>Placed</th><th></th></tr>${rows(list)}</table></div>`
+  : `<p class="sortnote">${esc(emptyText)}</p>`}
+</section>`;
+  };
+
+  return html(200, layout(`${SHOP} – Orders`, `<h2>Orders (${active.length}, ${plural(boxCount(active), "box", "boxes")})</h2>
 <h3>Delivery weeks</h3>
 <div class="scroll"><table><tr><th>Week</th><th>Order by</th><th>Boxes / limit</th></tr>${summary}</table></div>
-<h3>All orders <span class="sub">(<span id="deliveredCount">${active.filter((o) => o.delivered).length}</span> delivered, <span id="paidCount">${active.filter((o) => o.paid).length}</span> paid, of ${active.length}${cancelledCount ? `; ${cancelledCount} cancelled` : ""})</span></h3>
-<div class="scroll"><table><tr><th>Delivered</th><th>Paid</th><th>Delivery</th><th>Boxes</th><th>Name</th><th>Phone</th><th>Location</th><th>Notes</th><th>Placed</th><th></th></tr>${rows}</table></div>
+${section("Due this week", thisWeek ? `${prettyDate(weekStart)} – ${prettyDate(weekEnd)}` : "", due,
+  thisWeek ? "No orders for this week yet." : "There are no more delivery weeks set up.")}
+${section("Upcoming", weekEnd ? `After ${prettyDate(weekEnd)}` : "", upcoming, "No orders for later weeks yet.")}
+${earlier.length ? section("Earlier", `Before ${prettyDate(weekStart)}`, earlier, "") : ""}
 <form method="post" action="/orders"><input type="hidden" name="action" value="signout">
   <button type="submit" class="secondary">Sign out</button></form>
 <script>${ADMIN_JS}</script>`, { wide: true }));
@@ -728,7 +771,9 @@ async function adminPage(event) {
 const ADMIN_JS = `
   // Save a delivered/paid checkbox as soon as it's clicked; undo it if saving fails.
   document.querySelectorAll("form.deliv input[type=checkbox]").forEach((box) => {
-    const count = document.getElementById(box.name + "Count");
+    // This section's "to deliver" / "paid" number; data-dir says which way it moves.
+    const count = box.closest("section").querySelector('[data-count="' + box.name + '"]');
+    const step = (on) => { count.textContent = Number(count.textContent) + (on ? 1 : -1) * Number(count.dataset.dir); };
     // Delivered orders can't be cancelled, so hide that row's Cancel button.
     const cancel = box.closest("tr").querySelector("form.cancel button");
     const show = () => {
@@ -739,7 +784,7 @@ const ADMIN_JS = `
     box.addEventListener("change", async () => {
       const form = box.form;
       show();
-      count.textContent = Number(count.textContent) + (box.checked ? 1 : -1);
+      step(box.checked);
       const body = new URLSearchParams(new FormData(form)); // read before disabling: disabled boxes aren't sent
       box.disabled = true;
       try {
@@ -753,7 +798,7 @@ const ADMIN_JS = `
       } catch (e) {
         box.checked = !box.checked;
         show();
-        count.textContent = Number(count.textContent) + (box.checked ? 1 : -1);
+        step(box.checked);
         alert(e instanceof TypeError ? "Couldn't save. Check your connection." : e.message); // TypeError = network failure
       } finally {
         box.disabled = false;
